@@ -1,0 +1,98 @@
+Bug 1 — entry.html: Spinner infinito (CAUSA DIRECTA)
+@if (true) {   <!-- ← "true" hardcodeado, NUNCA se oculta -->
+  <div>
+    <div class="spinner-border text-primary"></div>
+    <p class="mt-3">Validando acceso...</p>
+  </div>
+}
+Debería ser @if (loading). Con true el spinner es permanente sin importar qué pase en el TypeScript.
+
+Bug 2 — AuthInterceptor: intercepta el request /validate y lo bloquea
+El interceptor se ejecuta en todos los requests, incluyendo el de validación inicial en EntryComponent:
+
+// En EntryComponent:
+this.http.get(`${this.baseUrl}/validate`)  // ← no lleva token en el header manualmente
+
+// En el interceptor:
+const token = session.getToken(); // ← en este punto puede ser null o usar SessionService
+                                  //   que lee de localStorage con clave 'auth_token'
+El problema es que EntryComponent guarda el token con TokenStorageService.save() (clave auth_token en localStorage), pero el interceptor lee con SessionService.getToken() que también usa auth_token — debería funcionar, pero si el interceptor corre antes de que save() termine (SSR o timing), manda el request sin token y el backend devuelve 401, lo que activa:
+
+if (err.status === 401) {
+  session.clear();
+  router.navigate(['/entry']); // ← loop infinito /entry → 401 → /entry → ...
+}
+La versión nueva de EntryComponent (AfterViewInit) sí manda el token manualmente en el header, lo cual es la solución correcta para este caso.
+
+Bug 3 — access.guard: errores de sintaxis que impiden compilar
+// Línea con error - mezcla español e inglés:
+importar {isPlatformBrowser} desde '@angular/common';  // ← NO es TypeScript válido
+// Debe ser:
+import { isPlatformBrowser } from '@angular/common';
+
+// Variable inconsistente:
+if (payload.exp < now) {    // ← 'now' no existe, se declaró como 'ahora'
+  console.log("carga útil",carga útil)  // ← sintaxis inválida
+
+// Debe ser:
+if (payload.exp < ahora) {
+  console.log("payload", payload)
+Bug 4 — access.guard: import del servicio con nombre incorrecto
+import { TokenStorageService } from '../services/token-storage.servicio';
+//                                                              ^^^^^^^^
+//                                          "servicio" en español, archivo real es
+//                                          "token-storage.service"
+Bug 5 — SSR ejecuta /validate en el servidor
+El angular.json tiene SSR habilitado con outputMode: "server". Con ngOnInit + isPlatformBrowser, el guard debería proteger, pero el interceptor y el routing corren en servidor igualmente, causando requests fallidos antes de llegar al navegador.
+
+Resumen de correcciones prioritarias
+#	Archivo	Bug	Corrección
+1	entry.html	@if (true) hardcodeado	Cambiar a @if (loading)
+2	access.guard.ts	importar ... desde	import ... from
+3	access.guard.ts	now no definido	Usar ahora
+4	access.guard.ts	token-storage.servicio	token-storage.service
+5	access.guard.ts	console.log("carga útil",carga útil)	Sintaxis inválida, corregir
+6	entry.ts (versión vieja)	Interceptor bloquea /validate	Usar la versión AfterViewInit que manda el header manualmente
+El bug 1 es la causa directa del "pegado en Validando acceso..." — el spinner nunca se oculta porque la condición es literalmente true.
+
+
+
+
+Sí, el cambio a "outputMode": "browser" es correcto y necesario en tu caso, y es la solución adecuada al problema que tenías.
+
+Por qué es correcto
+Tu app es esencialmente un punto de entrada de autenticación (/entry?token=...) que:
+
+Lee un token de la URL
+Lo guarda en localStorage
+Redirige al dashboard
+Todo eso requiere el navegador — localStorage, queryParamMap, sessionStorage. No tiene ningún contenido que tenga sentido pre-renderizar en servidor.
+
+Qué cambia con outputMode: "browser"
+"server" (SSR)	"browser" (tu cambio)
+Renderizado	En servidor + hidratación	Solo en navegador
+localStorage en ngOnInit	Falla (no existe en servidor)	Funciona
+isPlatformBrowser necesario	Sí, en todos lados	No obligatorio
+CI/CD	Requiere Node server	Solo archivos estáticos
+Error de integración continua	Probable (falta server.ts config)	No aplica
+Por qué te daba error en CI
+Con outputMode: "server" el build genera un servidor Node que necesita:
+
+server.ts correctamente configurado
+main.server.ts con bootstrap SSR
+El pipeline de CI debe ejecutar el servidor, no solo servir estáticos
+Si tu CI solo sube archivos estáticos a un servidor web (Apache, Nginx, etc.), el modo "server" nunca va a funcionar en ese entorno.
+
+Lo que debes eliminar/ignorar ahora
+Con outputMode: "browser" ya no necesitas:
+
+// Esto ya no es necesario en ningún componente:
+@Inject(PLATFORM_ID) private platformId: Object
+isPlatformBrowser(this.platformId)
+
+// Ni en los servicios:
+if (!this.isBrowser) return;
+Aunque no rompen nada si los dejas, son código muerto porque siempre corres en navegador.
+
+Conclusión
+El cambio fue la decisión correcta para tu arquitectura. Una app que depende de localStorage y tokens en URL no se beneficia del SSR y sí sufre sus complicaciones.
